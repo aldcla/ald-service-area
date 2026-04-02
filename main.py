@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import httpx
 import json
@@ -36,38 +36,23 @@ def point_in_polygon(lat: float, lng: float) -> bool:
     return inside
 
 
-class AddressRequest(BaseModel):
-    address: str
-
-
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "ALD Service Area Checker", "polygon_points": len(POLYGON)}
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "polygon_points": len(POLYGON)}
-
-
-@app.post("/check")
-async def check_service_area(request: AddressRequest):
-    if not request.address or len(request.address.strip()) < 5:
+async def resolve_address(address: str) -> dict:
+    """Geocode address and return service area result."""
+    if not address or len(address.strip()) < 5:
         raise HTTPException(status_code=400, detail="Address is too short")
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
             "https://maps.googleapis.com/maps/api/geocode/json",
-            params={"address": request.address, "key": GOOGLE_MAPS_API_KEY},
+            params={"address": address, "key": GOOGLE_MAPS_API_KEY},
         )
-
-    data = resp.json()
+        data = resp.json()
 
     if data.get("status") != "OK" or not data.get("results"):
         return {
             "in_area": None,
             "error": f"Geocoding failed: {data.get('status', 'UNKNOWN')}",
-            "address": request.address,
+            "address": address,
             "message": "Could not verify the address — please continue the call normally.",
         }
 
@@ -75,7 +60,6 @@ async def check_service_area(request: AddressRequest):
     loc = result["geometry"]["location"]
     lat, lng = loc["lat"], loc["lng"]
     formatted = result["formatted_address"]
-
     in_area = point_in_polygon(lat, lng)
 
     return {
@@ -89,3 +73,40 @@ async def check_service_area(request: AddressRequest):
             else "That address appears to be outside our local service area."
         ),
     }
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "ALD Service Area Checker", "polygon_points": len(POLYGON)}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "polygon_points": len(POLYGON)}
+
+
+@app.post("/check")
+async def check_service_area(request: Request):
+    """
+    Accept address in multiple formats:
+    - Direct (Bland AI):  {"address": "123 Main St, Glendale CA"}
+    - Retell wrapper:     {"name": "CheckServiceArea", "args": {"address": "..."}, "call": {...}}
+    - Retell args-only:   {"address": "123 Main St, Glendale CA"}  (same as direct)
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # Extract address from any supported format
+    if "args" in body and isinstance(body["args"], dict):
+        # Retell default format: {name, call, args: {address: ...}}
+        address = body["args"].get("address", "")
+    else:
+        # Direct format or Retell args-only: {address: ...}
+        address = body.get("address", "")
+
+    if not address:
+        raise HTTPException(status_code=400, detail="No address provided")
+
+    return await resolve_address(address)
