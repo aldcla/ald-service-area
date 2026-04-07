@@ -7,3 +7,9 @@ services:
     envVars:
       - key: GOOGLE_MAPS_API_KEY
         sync: false
+      - key: GMAIL_ADDRESS
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: NOTIFICATION_EMAILS
+        sync: false
