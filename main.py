@@ -3,6 +3,7 @@ from pydantic import BaseModel
 import httpx
 import json
 import os
+import re
 import math
 import smtplib
 import logging
@@ -55,8 +56,17 @@ except Exception as e:
     print(f"ERROR loading ALD locations: {e}")
     ALD_LOCATIONS = []
 
-# Track processed call IDs in memory (resets on redeploy, but that's fine —
-# Retell only sends each call_analyzed event once)
+# NEW: Load zip-to-office mapping (authoritative, from ALD website)
+_zip_offices_path = Path(__file__).parent / "zip_offices.json"
+try:
+    with open(_zip_offices_path) as f:
+        ZIP_TO_OFFICES = json.load(f)
+    print(f"Loaded zip-to-office mapping: {len(ZIP_TO_OFFICES)} zip codes")
+except Exception as e:
+    print(f"ERROR loading zip-to-office mapping: {e}")
+    ZIP_TO_OFFICES = {}
+
+# Track processed call IDs in memory
 _processed_calls = set()
 
 
@@ -90,7 +100,7 @@ def haversine_miles(lat1, lng1, lat2, lng2):
 
 
 def find_nearest_locations(lat: float, lng: float, max_results: int = 3, max_miles: float = 100):
-    """Find nearest ALD franchise locations to a given lat/lng."""
+    """Find nearest ALD franchise locations by distance (FALLBACK ONLY)."""
     results = []
     for loc in ALD_LOCATIONS:
         if loc.get("lat") is None or loc.get("lng") is None:
@@ -108,6 +118,19 @@ def find_nearest_locations(lat: float, lng: float, max_results: int = 3, max_mil
             })
     results.sort(key=lambda x: x["distance_miles"])
     return results[:max_results]
+
+
+def extract_zip_from_address(formatted_address: str) -> str:
+    """Extract a 5-digit US zip code from a formatted address string."""
+    match = re.search(r'\b(\d{5})(?:\b|-)', formatted_address)
+    return match.group(1) if match else ""
+
+
+def find_offices_by_zip(zip_code: str) -> list:
+    """Look up which ALD offices serve a given zip code using the authoritative mapping."""
+    offices = ZIP_TO_OFFICES.get(zip_code, [])
+    # Filter out our office — caller is already calling us
+    return [o for o in offices if o.get("phone") != OUR_PHONE]
 
 
 async def geocode_address(address: str):
@@ -227,7 +250,6 @@ def format_call_email(call: dict) -> tuple[str, str]:
 
     # Build intake data rows
     intake_rows = ""
-    # Define display order for known fields
     field_labels = {
         "caller_name": "Caller Name",
         "property_address": "Property Address",
@@ -257,7 +279,6 @@ def format_call_email(call: dict) -> tuple[str, str]:
         "additional_notes": "Additional Notes",
     }
 
-    # First show known fields in order
     shown = set()
     for key, label in field_labels.items():
         if key in custom and custom[key]:
@@ -265,16 +286,13 @@ def format_call_email(call: dict) -> tuple[str, str]:
             intake_rows += f'<tr><td style="padding:6px 12px;font-weight:bold;vertical-align:top;white-space:nowrap;">{label}</td><td style="padding:6px 12px;">{val}</td></tr>\n'
             shown.add(key)
 
-    # Then show any extra fields not in our known list
     for key, val in custom.items():
         if key not in shown and val:
             label = key.replace("_", " ").title()
             intake_rows += f'<tr><td style="padding:6px 12px;font-weight:bold;vertical-align:top;white-space:nowrap;">{label}</td><td style="padding:6px 12px;">{str(val)}</td></tr>\n'
 
-    # Escape transcript for HTML
     transcript_html = transcript.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
 
-    # Build HTML
     html = f"""
     <div style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
         <div style="background: #1a5276; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
@@ -329,6 +347,7 @@ def root():
         "service": "ALD Service Area Checker",
         "polygon_points": len(POLYGON),
         "franchise_locations": len(ALD_LOCATIONS),
+        "zip_codes_mapped": len(ZIP_TO_OFFICES),
         "email_configured": bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD),
     }
 
@@ -339,6 +358,7 @@ def health():
         "status": "ok",
         "polygon_points": len(POLYGON),
         "franchise_locations": len(ALD_LOCATIONS),
+        "zip_codes_mapped": len(ZIP_TO_OFFICES),
         "email_configured": bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD),
     }
 
@@ -371,9 +391,8 @@ def get_current_time_post():
 async def check_service_area(request: Request):
     """
     Accept address in multiple formats:
-    - Direct (Bland AI):  {"address": "123 Main St, Glendale CA"}
-    - Retell wrapper:     {"name": "CheckServiceArea", "args": {"address": "..."}, "call": {...}}
-    - Retell args-only:   {"address": "123 Main St, Glendale CA"}  (same as direct)
+    - Direct:         {\"address\": \"123 Main St, Glendale CA\"}
+    - Retell wrapper: {\"name\": \"CheckServiceArea\", \"args\": {\"address\": \"...\"}, \"call\": {...}}
     """
     try:
         body = await request.json()
@@ -394,11 +413,14 @@ async def check_service_area(request: Request):
 @app.post("/find-location")
 async def find_location(request: Request):
     """
-    Find the nearest ALD franchise office for an out-of-area caller.
+    Find the correct ALD franchise office for an out-of-area caller.
 
-    Accept zip code or address in multiple formats:
-    - Direct:         {"zip_code": "90210"} or {"address": "Beverly Hills, CA"}
-    - Retell wrapper: {"name": "FindNearestOffice", "args": {"zip_code": "90210"}, "call": {...}}
+    Uses the AUTHORITATIVE zip-to-office mapping from the ALD website.
+    Each ALD franchise serves specific zip codes — this is NOT based on distance.
+
+    Accept address or zip code in multiple formats:
+    - Direct:         {"address": "123 Main St, Beverly Hills, CA 90210"} or {"zip_code": "90210"}
+    - Retell wrapper: {"name": "FindNearestOffice", "args": {"address": "..."}, "call": {...}}
     """
     try:
         body = await request.json()
@@ -413,60 +435,78 @@ async def find_location(request: Request):
     zip_code = args.get("zip_code", "").strip()
     address = args.get("address", "").strip()
 
-    search_query = zip_code if zip_code else address
-    if not search_query:
-        raise HTTPException(status_code=400, detail="No zip_code or address provided")
+    # If we have an address but no zip, try to extract zip from the address string first
+    if not zip_code and address:
+        zip_code = extract_zip_from_address(address)
 
-    lat, lng, formatted = await geocode_address(search_query)
+    # If still no zip, geocode the address to get the formatted address with zip
+    if not zip_code and address:
+        lat, lng, formatted = await geocode_address(address)
+        if formatted:
+            zip_code = extract_zip_from_address(formatted)
 
-    if lat is None:
+    if not zip_code:
+        if not address:
+            raise HTTPException(status_code=400, detail="No zip_code or address provided")
+        # Last resort: try geocoding with the raw address for the zip
         return {
             "found": False,
-            "message": "Could not look up that location. Please try again.",
+            "message": "Could not determine the zip code for that address. You can visit americanleakdetection.com/locations to find the closest office.",
             "locations": [],
         }
 
-    nearby = find_nearest_locations(lat, lng, max_results=3, max_miles=100)
+    # ─── PRIMARY: Authoritative zip-to-office lookup ───
+    offices = find_offices_by_zip(zip_code)
 
-    if not nearby:
-        return {
-            "found": False,
-            "message": "We could not find an American Leak Detection office near that area. You can visit americanleakdetection.com/locations to find the closest office.",
-            "locations": [],
-        }
+    if offices:
+        # Found offices for this zip (with our office filtered out)
+        if len(offices) == 1:
+            loc = offices[0]
+            return {
+                "found": True,
+                "count": 1,
+                "referral_phone": loc["phone"],
+                "referral_name": loc["name"],
+                "message": f"The office that serves your area is {loc['name']}. Their phone number is {loc['phone']}.",
+                "locations": offices,
+                "lookup_method": "zip_assignment",
+            }
+        else:
+            # Multiple offices serve this zip — return the first non-our-office one
+            best = offices[0]
+            return {
+                "found": True,
+                "count": len(offices),
+                "referral_phone": best["phone"],
+                "referral_name": best["name"],
+                "message": f"The office that serves your area is {best['name']}. Their phone number is {best['phone']}.",
+                "locations": offices,
+                "lookup_method": "zip_assignment",
+            }
 
-    if len(nearby) == 1:
-        loc = nearby[0]
+    # ─── Check if only OUR office serves this zip ───
+    all_offices_for_zip = ZIP_TO_OFFICES.get(zip_code, [])
+    if all_offices_for_zip:
+        # The zip IS assigned — but only to our office. This shouldn't happen
+        # for out-of-area callers, but handle gracefully.
         return {
             "found": True,
             "count": 1,
-            "referral_phone": loc["phone"],
-            "referral_name": loc["name"],
-            "message": f"The nearest office is {loc['name']}. Their phone number is {loc['phone']}.",
-            "locations": nearby,
+            "referral_phone": OUR_PHONE,
+            "referral_name": all_offices_for_zip[0]["name"],
+            "message": f"That zip code is served by our office. Their phone number is {OUR_PHONE}.",
+            "locations": all_offices_for_zip,
+            "lookup_method": "zip_assignment_own_office",
         }
 
-    non_ours = [l for l in nearby if l["phone"] != OUR_PHONE]
-
-    if not non_ours:
-        loc = nearby[0]
-        return {
-            "found": True,
-            "count": 1,
-            "referral_phone": loc["phone"],
-            "referral_name": loc["name"],
-            "message": f"The nearest office is {loc['name']}. Their phone number is {loc['phone']}.",
-            "locations": nearby,
-        }
-
-    best = non_ours[0]
+    # ─── FALLBACK: Zip not found in mapping ───
+    # This means no ALD franchise has claimed this zip code.
+    # Direct to the website as a last resort.
     return {
-        "found": True,
-        "count": len(non_ours),
-        "referral_phone": best["phone"],
-        "referral_name": best["name"],
-        "message": f"The nearest office is {best['name']}. Their phone number is {best['phone']}.",
-        "locations": non_ours,
+        "found": False,
+        "message": "We could not find an American Leak Detection office assigned to that area. You can visit americanleakdetection.com/locations to find the closest office.",
+        "locations": [],
+        "lookup_method": "zip_not_found",
     }
 
 
@@ -499,11 +539,9 @@ async def retell_webhook(request: Request, background_tasks: BackgroundTasks):
     event = body.get("event", "")
     logger.info(f"Webhook received: event={event}")
 
-    # Only process call_analyzed events
     if event != "call_analyzed":
         return {"status": "ignored", "event": event}
 
-    # Check email config
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD or not NOTIFICATION_EMAILS:
         logger.error("Email not configured — skipping email send")
         return {
@@ -514,14 +552,12 @@ async def retell_webhook(request: Request, background_tasks: BackgroundTasks):
     call = body.get("call", {})
     call_id = call.get("call_id", "unknown")
 
-    # Dedup
     if call_id in _processed_calls:
         logger.info(f"Call {call_id} already processed — skipping")
         return {"status": "duplicate", "call_id": call_id}
 
     _processed_calls.add(call_id)
 
-    # Send email in background so we return 200 fast (Retell has timeout)
     background_tasks.add_task(_send_call_email, call)
 
     return {"status": "accepted", "call_id": call_id}
@@ -531,7 +567,6 @@ async def retell_webhook(request: Request, background_tasks: BackgroundTasks):
 async def retell_webhook_test():
     """
     Health check for the webhook endpoint.
-    Returns config status so you can verify email is set up correctly.
     """
     return {
         "status": "ok",
