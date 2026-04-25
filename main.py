@@ -33,6 +33,7 @@ NOTIFICATION_EMAILS = [
 ]
 
 OUR_PHONE = "(818) 593-0943"
+NW_LA_PHONE = "(818) 877-4612"
 LA_TZ = timezone(timedelta(hours=-7))  # Pacific Daylight Time
 
 # ──────────────────────────────────────────────
@@ -65,6 +66,15 @@ try:
 except Exception as e:
     print(f"ERROR loading zip-to-office mapping: {e}")
     ZIP_TO_OFFICES = {}
+
+# Build a set of zip codes served by the NW LA County office for fast lookup
+NW_LA_COUNTY_ZIPS = set()
+for _zip, _offices in ZIP_TO_OFFICES.items():
+    for _office in _offices:
+        if _office.get("phone") == NW_LA_PHONE or "Northwest Los Angeles" in _office.get("name", ""):
+            NW_LA_COUNTY_ZIPS.add(_zip)
+            break
+print(f"NW LA County office serves {len(NW_LA_COUNTY_ZIPS)} zip codes")
 
 # Track processed call IDs in memory
 _processed_calls = set()
@@ -151,7 +161,7 @@ async def geocode_address(address: str):
 
 
 async def resolve_address(address: str) -> dict:
-    """Geocode address and return service area result."""
+    """Geocode address and return service area result, including NW LA County check."""
     if not address or len(address.strip()) < 5:
         raise HTTPException(status_code=400, detail="Address is too short")
 
@@ -160,6 +170,7 @@ async def resolve_address(address: str) -> dict:
     if lat is None:
         return {
             "in_area": None,
+            "nw_la_county_area": False,
             "error": "Geocoding failed",
             "address": address,
             "message": "Could not verify the address — please continue the call normally.",
@@ -167,8 +178,13 @@ async def resolve_address(address: str) -> dict:
 
     in_area = point_in_polygon(lat, lng)
 
-    return {
+    # Check if the zip code belongs to the NW LA County office's territory
+    zip_code = extract_zip_from_address(formatted) if formatted else ""
+    nw_la = zip_code in NW_LA_COUNTY_ZIPS if zip_code else False
+
+    result = {
         "in_area": in_area,
+        "nw_la_county_area": nw_la,
         "formatted_address": formatted,
         "lat": lat,
         "lng": lng,
@@ -178,6 +194,14 @@ async def resolve_address(address: str) -> dict:
             else "That address appears to be outside our local service area."
         ),
     }
+
+    if nw_la:
+        result["nw_la_county_note"] = (
+            "This address is in the territory served by American Leak Detection of Northwest Los Angeles County. "
+            "Ask the caller if their issue is related to an indoor gas leak, water intrusion not related to plumbing, or smoke testing."
+        )
+
+    return result
 
 
 # ──────────────────────────────────────────────
@@ -348,6 +372,7 @@ def root():
         "polygon_points": len(POLYGON),
         "franchise_locations": len(ALD_LOCATIONS),
         "zip_codes_mapped": len(ZIP_TO_OFFICES),
+        "nw_la_county_zips": len(NW_LA_COUNTY_ZIPS),
         "email_configured": bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD),
     }
 
@@ -359,6 +384,7 @@ def health():
         "polygon_points": len(POLYGON),
         "franchise_locations": len(ALD_LOCATIONS),
         "zip_codes_mapped": len(ZIP_TO_OFFICES),
+        "nw_la_county_zips": len(NW_LA_COUNTY_ZIPS),
         "email_configured": bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD),
     }
 
@@ -391,8 +417,11 @@ def get_current_time_post():
 async def check_service_area(request: Request):
     """
     Accept address in multiple formats:
-    - Direct:         {\"address\": \"123 Main St, Glendale CA\"}
-    - Retell wrapper: {\"name\": \"CheckServiceArea\", \"args\": {\"address\": \"...\"}, \"call\": {...}}
+    - Direct:         {"address": "123 Main St, Glendale CA"}
+    - Retell wrapper: {"name": "CheckServiceArea", "args": {"address": "..."}, "call": {...}}
+
+    Returns in_area (bool) AND nw_la_county_area (bool) — the latter flags whether the
+    caller's zip code is in the territory served by ALD of Northwest Los Angeles County.
     """
     try:
         body = await request.json()
