@@ -76,26 +76,9 @@ for _zip, _offices in ZIP_TO_OFFICES.items():
             break
 print(f"NW LA County office serves {len(NW_LA_COUNTY_ZIPS)} zip codes")
 
-# CLA (North Central Los Angeles) assigned zip codes — from ALD website
-# These supplement the polygon: if a caller's zip is in this list, they are in our service area
-# even if the polygon check says they're outside (polygon may not cover every CLA zip perfectly)
-CLA_ASSIGNED_ZIPS = {
-    "90001", "90002", "90003", "90004", "90005", "90006", "90007", "90008",
-    "90010", "90011", "90012", "90013", "90014", "90015", "90016", "90017",
-    "90018", "90019", "90020", "90021", "90022", "90023", "90026", "90027",
-    "90028", "90029", "90031", "90032", "90033", "90035", "90036", "90037",
-    "90038", "90039", "90040", "90041", "90042", "90043", "90044", "90046",
-    "90047", "90048", "90056", "90057", "90058", "90059", "90061", "90062",
-    "90063", "90065", "90068", "90069", "90071", "90089", "90201", "90221",
-    "90222", "90247", "90248", "90249", "90250", "90255", "90262", "90270",
-    "90280", "90301", "90302", "90303", "90304", "90305", "91020", "91040",
-    "91042", "91201", "91202", "91203", "91204", "91205", "91206", "91207",
-    "91208", "91214", "91331", "91340", "91342", "91343", "91345", "91352",
-    "91401", "91402", "91403", "91405", "91406", "91411", "91423", "91501",
-    "91502", "91504", "91505", "91506", "91510", "91521", "91522", "91523",
-    "91601", "91602", "91604", "91605", "91606", "91607", "91608",
-}
-print(f"CLA assigned zip codes: {len(CLA_ASSIGNED_ZIPS)}")
+# NOTE: CLA_ASSIGNED_ZIPS removed. The polygon is the SOLE authority for
+# determining whether a caller is in our service area. The ALD website's
+# zip-to-office assignments are broader than our actual operational territory.
 
 # Track processed call IDs in memory
 _processed_calls = set()
@@ -194,12 +177,11 @@ async def geocode_address(address: str):
 async def resolve_address(address: str) -> dict:
     """Geocode address and return service area result.
 
-    The polygon is the PRIMARY check. CLA's assigned zip codes SUPPLEMENT
-    the polygon — if a zip is assigned to CLA by the ALD website, the caller
-    is in our area even if the polygon doesn't cover that precise location.
+    The polygon is the SOLE authority for determining in_area.
+    If the address is inside the polygon, in_area = true.
 
     The NW LA County question ONLY fires when the caller is OUTSIDE our area
-    (both polygon and CLA zips say no) AND the zip belongs to NW LA County.
+    (polygon says no) AND the zip belongs to NW LA County.
     """
     if not address or len(address.strip()) < 5:
         raise HTTPException(status_code=400, detail="Address is too short")
@@ -215,19 +197,14 @@ async def resolve_address(address: str) -> dict:
             "message": "Could not verify the address — please continue the call normally.",
         }
 
-    polygon_result = point_in_polygon(lat, lng)
+    # The polygon is the SOLE authority for in_area determination
+    in_area = point_in_polygon(lat, lng)
 
     # Extract zip code from geocoded address
     zip_code = extract_zip_from_address(formatted) if formatted else ""
 
-    # CLA zip check: is this zip assigned to our office?
-    cla_zip = zip_code in CLA_ASSIGNED_ZIPS if zip_code else False
-
-    # FINAL in_area decision: inside polygon OR in a CLA-assigned zip code
-    in_area = polygon_result or cla_zip
-
     # NW LA County check: ONLY relevant when caller is OUTSIDE our area
-    # If they're in our area (polygon or CLA zip), we handle the call — no referral question
+    # If they're in our area (polygon), we handle the call — no referral question
     nw_la = False
     if not in_area and zip_code:
         nw_la = zip_code in NW_LA_COUNTY_ZIPS
@@ -244,10 +221,6 @@ async def resolve_address(address: str) -> dict:
             else "That address appears to be outside our local service area."
         ),
     }
-
-    # Add detail about how in_area was determined
-    if in_area and not polygon_result and cla_zip:
-        result["note"] = "Address is outside the polygon but the zip code is assigned to our office."
 
     if nw_la:
         result["nw_la_county_note"] = (
@@ -424,7 +397,6 @@ def root():
         "status": "ok",
         "service": "ALD Service Area Checker",
         "polygon_points": len(POLYGON),
-        "cla_assigned_zips": len(CLA_ASSIGNED_ZIPS),
         "franchise_locations": len(ALD_LOCATIONS),
         "zip_codes_mapped": len(ZIP_TO_OFFICES),
         "nw_la_county_zips": len(NW_LA_COUNTY_ZIPS),
@@ -437,7 +409,6 @@ def health():
     return {
         "status": "ok",
         "polygon_points": len(POLYGON),
-        "cla_assigned_zips": len(CLA_ASSIGNED_ZIPS),
         "franchise_locations": len(ALD_LOCATIONS),
         "zip_codes_mapped": len(ZIP_TO_OFFICES),
         "nw_la_county_zips": len(NW_LA_COUNTY_ZIPS),
