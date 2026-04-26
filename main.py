@@ -152,9 +152,19 @@ def find_nearest_locations(lat: float, lng: float, max_results: int = 3, max_mil
 
 
 def extract_zip_from_address(formatted_address: str) -> str:
-    """Extract a 5-digit US zip code from a formatted address string."""
-    match = re.search(r'\b(\d{5})(?:\b|-)', formatted_address)
-    return match.group(1) if match else ""
+    """Extract a 5-digit US zip code from a formatted address string.
+    
+    Looks for the zip code AFTER the state abbreviation (e.g. ', CA 91343')
+    to avoid matching 5-digit street numbers like 15651 or 12345.
+    Falls back to the LAST 5-digit number in the string.
+    """
+    # Primary: zip after 2-letter state abbreviation (", CA 91343" or " CA 91343")
+    match = re.search(r'[,\s]\s*[A-Z]{2}\s+(\d{5})\b', formatted_address)
+    if match:
+        return match.group(1)
+    # Fallback: last 5-digit number in the string (most likely the zip)
+    matches = re.findall(r'\b(\d{5})\b', formatted_address)
+    return matches[-1] if matches else ""
 
 
 def find_offices_by_zip(zip_code: str) -> list:
